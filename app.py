@@ -54,7 +54,7 @@ def product_page(product_id):
 @app.route('/api/product/<product_id>', methods=['GET'])
 def get_product(product_id):
     try:
-        food_res = supabase.table('foods').select('*').eq('id', product_id).execute()
+        food_res = supabase.table('foods').select('*').eq('id', product_id).eq('is_available', True).execute()
         if not food_res.data:
             return jsonify({'status': 'error', 'message': 'Product not found'}), 404
         food = food_res.data[0]
@@ -63,7 +63,7 @@ def get_product(product_id):
         image_res = supabase.table('food_images').select('*').eq('food_id', product_id).execute()
 
         price = float(variant_res.data[0]['price']) if variant_res.data else 0.0
-        
+
         images = [img['image_url'] for img in image_res.data] if image_res.data else []
         image = images[0] if images else ''
 
@@ -89,14 +89,14 @@ def serve_static(filename):
 @app.route('/api/foods', methods=['GET'])
 def get_foods():
     try:
-        # Fetch foods where is_available is true (optional, depends on schema defaults)
-        foods_res = supabase.table('foods').select('*').execute()
+        # Fetch only available foods
+        foods_res = supabase.table('foods').select('*').eq('is_available', True).execute()
         foods = foods_res.data
-        
+
         # Fetch variants and images
         variants_res = supabase.table('food_variants').select('*').execute()
         images_res = supabase.table('food_images').select('*').execute()
-        
+
         variants = {v['food_id']: v for v in variants_res.data}
         # Group images by food_id
         images_by_food = {}
@@ -105,7 +105,7 @@ def get_foods():
             if fid not in images_by_food:
                 images_by_food[fid] = []
             images_by_food[fid].append(img['image_url'])
-        
+
         formatted_foods = []
         for f in foods:
             food_id = f['id']
@@ -119,7 +119,7 @@ def get_foods():
                 'image': food_images[0], # Primary image for listing
                 'images': food_images # Full array for internal use
             })
-            
+
         formatted_foods.sort(key=lambda x: x['name'])
         return jsonify(formatted_foods)
     except Exception as e:
@@ -193,18 +193,34 @@ def login():
         print(f"Login error: {e}")
         return jsonify({"status": "error", "message": "Invalid credentials"}), 401
 
-# --- ORDERS API ---
+# --- BOOKINGS API ---
+@app.route('/api/bookings', methods=['POST'])
 @app.route('/api/checkout', methods=['POST'])
-def checkout():
+def create_booking():
     data = request.json
     try:
-        # Create Order — use service-role client to bypass RLS
+        # Create booking request with waiting status. Admin approves later.
         user_id = data.get('user_id') or None
+        phone = (data.get('phone') or '').strip()
+        address = (data.get('address') or '').strip()
+
+        # Keep latest contact details in profile for admin visibility.
+        if user_id and (phone or address):
+            profile_payload = {}
+            if phone:
+                profile_payload['phone'] = phone
+            if address:
+                profile_payload['address'] = address
+            try:
+                supabase_admin.table('users_profile').update(profile_payload).eq('id', user_id).execute()
+            except Exception as profile_err:
+                # Do not block booking creation if profile sync fails.
+                print(f"Profile update warning: {profile_err}")
 
         order_res = supabase_admin.table('orders').insert({
             'user_id': user_id,
             'total_amount': float(data['total']),
-            'status': 'Pending'
+            'status': 'Waiting Approval'
         }).execute()
 
         order_id = order_res.data[0]['id']
@@ -226,26 +242,104 @@ def checkout():
 
         supabase_admin.table('order_items').insert(order_items_data).execute()
         
-        return jsonify({"status": "success", "message": "Order placed successfully!", "order_id": order_id})
+        return jsonify({
+            "status": "success",
+            "message": "Booking request submitted. Please wait for admin approval.",
+            "order_id": order_id
+        })
     except Exception as e:
-        print(f"Checkout error: {e}")
-        return jsonify({"status": "error", "message": "Failed to place order"}), 500
+        print(f"Booking error: {e}")
+        return jsonify({"status": "error", "message": "Failed to submit booking request"}), 500
 
 @app.route('/api/orders/<order_id>', methods=['GET'])
 def get_order(order_id):
     try:
-        order_res = supabase.table('orders').select('*').eq('id', order_id).execute()
+        normalized_id = (order_id or '').strip()
+        order_res = supabase_admin.table('orders').select('*').eq('id', normalized_id).limit(1).execute()
         if not order_res.data:
             return jsonify({"status": "error", "message": "Order not found"}), 404
+
+        order = order_res.data[0]
+        if (order.get('status') or '').strip().lower() == 'delivered':
+            return jsonify({
+                "status": "error",
+                "message": "Delivered orders are not available for tracking"
+            }), 400
             
         return jsonify({"status": "success", "order": {
-            "id": order_res.data[0]['id'],
-            "status": order_res.data[0]['status'],
-            "total": float(order_res.data[0]['total_amount'] or 0)
+            "id": order['id'],
+            "status": order['status'],
+            "total": float(order.get('total_amount') or 0)
         }})
     except Exception as e:
         print(f"Fetch order error: {e}")
         return jsonify({"status": "error", "message": "Invalid Order ID"}), 400
+
+@app.route('/api/orders/history/<user_id>', methods=['GET'])
+def get_order_history(user_id):
+    try:
+        normalized_user_id = (user_id or '').strip()
+        if not normalized_user_id:
+            return jsonify({"status": "error", "message": "Missing user id"}), 400
+
+        orders_res = (
+            supabase_admin
+            .table('orders')
+            .select('id, status, total_amount, created_at')
+            .eq('user_id', normalized_user_id)
+            .order('created_at', desc=True)
+            .execute()
+        )
+
+        order_ids = [o.get('id') for o in (orders_res.data or []) if o.get('id')]
+        items_by_order = {}
+        if order_ids:
+            items_res = (
+                supabase_admin
+                .table('order_items')
+                .select('order_id, quantity, foods(name)')
+                .in_('order_id', order_ids)
+                .execute()
+            )
+
+            for item in (items_res.data or []):
+                oid = item.get('order_id')
+                if oid not in items_by_order:
+                    items_by_order[oid] = []
+                items_by_order[oid].append({
+                    'name': (item.get('foods') or {}).get('name', 'Unknown Item'),
+                    'quantity': int(item.get('quantity') or 0)
+                })
+
+        orders = []
+        for o in (orders_res.data or []):
+            status = o.get('status') or 'Unknown'
+            orders.append({
+                'id': o.get('id'),
+                'status': status,
+                'total': float(o.get('total_amount') or 0),
+                'created_at': o.get('created_at'),
+                'trackable': status.strip().lower() != 'delivered',
+                'items': items_by_order.get(o.get('id'), [])
+            })
+
+        return jsonify({"status": "success", "orders": orders})
+    except Exception as e:
+        print(f"Order history error: {e}")
+        return jsonify({"status": "error", "message": "Failed to fetch order history"}), 500
+
+@app.route('/api/orders/history/<user_id>/delivered', methods=['DELETE'])
+def clear_delivered_orders(user_id):
+    try:
+        normalized_user_id = (user_id or '').strip()
+        if not normalized_user_id:
+            return jsonify({"status": "error", "message": "Missing user id"}), 400
+
+        supabase_admin.table('orders').delete().eq('user_id', normalized_user_id).eq('status', 'Delivered').execute()
+        return jsonify({"status": "success", "message": "Delivered orders removed from history"})
+    except Exception as e:
+        print(f"Clear history error: {e}")
+        return jsonify({"status": "error", "message": "Failed to clear delivered orders"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
