@@ -325,7 +325,10 @@ function renderOrdersTable() {
       <tr style="cursor: pointer;" onclick="showOrderDetails('${o.id}')">
         <td><strong>${o.id.substring(0, 8)}...</strong></td>
         <td class="text-sm text-muted">${orderDate}</td>
-        <td><div class="font-semibold">${o.customer}</div></td>
+        <td>
+          <div class="font-semibold">${o.customer}</div>
+          <div class="text-sm text-muted">${o.phone || 'N/A'}</div>
+        </td>
         <td style="font-size: 0.85rem; color: var(--text-muted)">${itemsHtml}</td>
         <td><strong>${formatCurrency(o.total)}</strong></td>
         <td><span class="badge ${statusClass}">${o.status}</span></td>
