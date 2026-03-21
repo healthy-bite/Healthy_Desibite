@@ -1,2 +1,5 @@
 [build]
-python = "3.11"
+nixpacks_version = "1.24.0"
+
+[build.packages]
+python = "3.12"
